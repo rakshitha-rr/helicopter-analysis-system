@@ -848,12 +848,9 @@ def _make_graph_image(report_graph, graph_df, output_dir, prefix="graph"):
         # Match Visualization X-axis tick spacing.
         if pd.api.types.is_datetime64_any_dtype(x_values):
             import matplotlib.dates as mdates
-            # Keep the requested 2-minute tick interval, but rotate the
-            # labels so adjacent HH:MM:SS values do not overlap in reports.
             ax.xaxis.set_major_locator(mdates.MinuteLocator(interval=2))
             ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M:%S"))
-            ax.tick_params(axis="x", labelsize=7, pad=2)
-            plt.setp(ax.get_xticklabels(), rotation=45, ha="right")
+            fig.autofmt_xdate(rotation=0, ha="center")
         elif pd.api.types.is_numeric_dtype(x_values):
             ax.xaxis.set_major_locator(MaxNLocator(nbins=8, steps=[2]))
 
@@ -2350,7 +2347,9 @@ def _create_cleaned_xlsx(source_path, delete_rows_1based, output_path):
     delete_set = {int(x) for x in delete_rows_1based if 1 <= int(x) <= 6}
 
     if extension == ".xlsx":
-        from lxml import etree
+        # Use Python standard-library XML parsing so deletion also works on
+        # Streamlit Cloud without requiring an extra native dependency.
+        etree = ET
 
         NS_MAIN = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
         NS_REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
@@ -2384,6 +2383,8 @@ def _create_cleaned_xlsx(source_path, delete_rows_1based, output_path):
                 shifted.append(new_part)
             return ":".join(shifted)
 
+        ET.register_namespace("", NS_MAIN)
+        ET.register_namespace("r", NS_REL)
         with zipfile.ZipFile(source_path, "r") as zin:
             names = zin.namelist()
             workbook_xml = zin.read("xl/workbook.xml")
@@ -2426,7 +2427,7 @@ def _create_cleaned_xlsx(source_path, delete_rows_1based, output_path):
             # faster than loading the workbook through openpyxl and rewriting
             # every cell as a Python object.
             for row in list(sheet_data):
-                if etree.QName(row).localname != "row":
+                if str(row.tag).rsplit("}", 1)[-1] != "row":
                     continue
                 old_r = int(row.get("r", "0"))
                 if old_r in delete_set:
@@ -2436,7 +2437,7 @@ def _create_cleaned_xlsx(source_path, delete_rows_1based, output_path):
                 new_r = _shift_row_number(old_r)
                 row.set("r", str(new_r))
                 for cell in row:
-                    if etree.QName(cell).localname == "c":
+                    if str(cell.tag).rsplit("}", 1)[-1] == "c":
                         ref = cell.get("r")
                         if ref:
                             cell.set("r", _shift_cell_ref(ref))
@@ -2448,8 +2449,7 @@ def _create_cleaned_xlsx(source_path, delete_rows_1based, output_path):
             new_sheet_xml = etree.tostring(
                 sheet_root,
                 xml_declaration=True,
-                encoding="UTF-8",
-                standalone=True
+                encoding="UTF-8"
             )
 
             os.makedirs(os.path.dirname(output_path), exist_ok=True)
