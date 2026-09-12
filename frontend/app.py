@@ -28,18 +28,6 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-import matplotlib.pyplot as plt
-from matplotlib.ticker import MaxNLocator
-from docx import Document
-from docx.shared import Inches, Pt
-from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.enum.table import WD_TABLE_ALIGNMENT
-from reportlab.lib import colors
-from reportlab.lib.enums import TA_CENTER
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.units import inch
-from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer, Image, Table, TableStyle, PageBreak)
 from openpyxl import Workbook
 from openpyxl.drawing.image import Image as XLImage
 from openpyxl.styles import Font as XLFont, PatternFill, Alignment, Border, Side
@@ -816,6 +804,8 @@ def _make_graph_image(report_graph, graph_df, output_dir, prefix="graph"):
     # different graph from a separate sample.
     display_graph = _downsample_for_plot(plot_df) if not plot_df.empty else plot_df
 
+    import matplotlib.pyplot as plt
+    from matplotlib.ticker import MaxNLocator
     fig, ax = plt.subplots(figsize=(10.8, 5.8), dpi=150)
     if display_graph.empty:
         ax.text(0.5, 0.5, "No plottable numeric data", ha="center", va="center")
@@ -848,9 +838,12 @@ def _make_graph_image(report_graph, graph_df, output_dir, prefix="graph"):
         # Match Visualization X-axis tick spacing.
         if pd.api.types.is_datetime64_any_dtype(x_values):
             import matplotlib.dates as mdates
+            # Keep the requested 2-minute tick interval, but rotate the
+            # labels so adjacent HH:MM:SS values do not overlap in reports.
             ax.xaxis.set_major_locator(mdates.MinuteLocator(interval=2))
             ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M:%S"))
-            fig.autofmt_xdate(rotation=0, ha="center")
+            ax.tick_params(axis="x", labelsize=7, pad=2)
+            plt.setp(ax.get_xticklabels(), rotation=45, ha="right")
         elif pd.api.types.is_numeric_dtype(x_values):
             ax.xaxis.set_major_locator(MaxNLocator(nbins=8, steps=[2]))
 
@@ -870,6 +863,8 @@ def _make_anomaly_image(anomaly_item, graph_df, output_dir):
     plot_df[y_axis] = pd.to_numeric(plot_df[y_axis], errors="coerce")
     plot_df = plot_df.dropna(subset=[x_axis, y_axis])
 
+    import matplotlib.pyplot as plt
+    from matplotlib.ticker import MaxNLocator
     fig, ax = plt.subplots(figsize=(10.8, 5.8), dpi=150)
     if not plot_df.empty:
         ax.plot(plot_df[x_axis], plot_df[y_axis], linewidth=1.8, marker="o", markersize=2.5, label="Normal readings")
@@ -918,6 +913,10 @@ def _add_docx_heading(document, text, level=1):
 
 def _generate_docx(report, graph_images, anomaly_images):
     """Word report: graph + Maximum + Minimum for every graph, and nothing else."""
+    from docx import Document
+    from docx.shared import Inches, Pt
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.enum.table import WD_TABLE_ALIGNMENT
     doc = Document()
     section = doc.sections[0]
     section.top_margin = Inches(0.6)
@@ -965,6 +964,12 @@ def _generate_docx(report, graph_images, anomaly_images):
 def _generate_pdf(report, graph_images, anomaly_images):
     """PDF report: graph + Maximum + Minimum for every graph, and nothing else."""
     out = io.BytesIO()
+    from reportlab.lib import colors
+    from reportlab.lib.enums import TA_CENTER
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import inch
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, Table, TableStyle, PageBreak
     doc = SimpleDocTemplate(
         out, pagesize=A4,
         rightMargin=36, leftMargin=36, topMargin=36, bottomMargin=36
@@ -2347,9 +2352,7 @@ def _create_cleaned_xlsx(source_path, delete_rows_1based, output_path):
     delete_set = {int(x) for x in delete_rows_1based if 1 <= int(x) <= 6}
 
     if extension == ".xlsx":
-        # Use Python standard-library XML parsing so deletion also works on
-        # Streamlit Cloud without requiring an extra native dependency.
-        etree = ET
+        from lxml import etree
 
         NS_MAIN = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
         NS_REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
@@ -2383,8 +2386,6 @@ def _create_cleaned_xlsx(source_path, delete_rows_1based, output_path):
                 shifted.append(new_part)
             return ":".join(shifted)
 
-        ET.register_namespace("", NS_MAIN)
-        ET.register_namespace("r", NS_REL)
         with zipfile.ZipFile(source_path, "r") as zin:
             names = zin.namelist()
             workbook_xml = zin.read("xl/workbook.xml")
@@ -2427,7 +2428,7 @@ def _create_cleaned_xlsx(source_path, delete_rows_1based, output_path):
             # faster than loading the workbook through openpyxl and rewriting
             # every cell as a Python object.
             for row in list(sheet_data):
-                if str(row.tag).rsplit("}", 1)[-1] != "row":
+                if etree.QName(row).localname != "row":
                     continue
                 old_r = int(row.get("r", "0"))
                 if old_r in delete_set:
@@ -2437,7 +2438,7 @@ def _create_cleaned_xlsx(source_path, delete_rows_1based, output_path):
                 new_r = _shift_row_number(old_r)
                 row.set("r", str(new_r))
                 for cell in row:
-                    if str(cell.tag).rsplit("}", 1)[-1] == "c":
+                    if etree.QName(cell).localname == "c":
                         ref = cell.get("r")
                         if ref:
                             cell.set("r", _shift_cell_ref(ref))
@@ -2449,7 +2450,8 @@ def _create_cleaned_xlsx(source_path, delete_rows_1based, output_path):
             new_sheet_xml = etree.tostring(
                 sheet_root,
                 xml_declaration=True,
-                encoding="UTF-8"
+                encoding="UTF-8",
+                standalone=True
             )
 
             os.makedirs(os.path.dirname(output_path), exist_ok=True)
