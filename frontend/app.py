@@ -2343,134 +2343,124 @@ def _read_first_six_raw_rows(file_path, file_signature=None, file_size=None, fil
 
 
 def _create_cleaned_xlsx(source_path, delete_rows_1based, output_path):
-    """Create a cleaned XLSX without rebuilding the workbook through openpyxl.
-
-    For large telemetry workbooks, only the selected worksheet XML is parsed;
-    styles, shared strings, drawings, and all other workbook parts are retained.
-    """
+    """Create a cleaned XLSX using low-memory streaming XML editing."""
     extension = os.path.splitext(source_path)[1].lower()
     delete_set = {int(x) for x in delete_rows_1based if 1 <= int(x) <= 6}
 
     if extension == ".xlsx":
         from lxml import etree
-
         NS_MAIN = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
         NS_REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
         NS_PKG_REL = "http://schemas.openxmlformats.org/package/2006/relationships"
 
-        def _shift_row_number(old_row):
-            # Only six possible rows can be removed, so this is tiny and avoids
-            # allocating a lookup table for the full worksheet.
+        def shift_row_number(old_row):
             return old_row - sum(1 for n in delete_set if n < old_row)
 
-        def _shift_cell_ref(ref):
+        def shift_cell_ref(ref):
             if not ref:
                 return ref
             m = re.match(r"^([A-Za-z]+)(\d+)(.*)$", str(ref))
             if not m:
                 return ref
-            row_num = int(m.group(2))
-            if row_num <= 6 and row_num in delete_set:
-                return None
-            return f"{m.group(1)}{_shift_row_number(row_num)}{m.group(3)}"
+            return f"{m.group(1)}{shift_row_number(int(m.group(2)))}{m.group(3)}"
 
-        def _shift_a1_range(value):
+        def shift_range(value):
             if not value:
                 return value
-            parts = str(value).split(":")
-            shifted = []
-            for part in parts:
-                new_part = _shift_cell_ref(part)
-                if new_part is None:
-                    return value
-                shifted.append(new_part)
-            return ":".join(shifted)
+            return ":".join(shift_cell_ref(part) for part in str(value).split(":"))
+
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        temp_xml = output_path + ".sheet.tmp"
 
         with zipfile.ZipFile(source_path, "r") as zin:
-            names = zin.namelist()
-            workbook_xml = zin.read("xl/workbook.xml")
-            rels_xml = zin.read("xl/_rels/workbook.xml.rels")
-            workbook_root = etree.fromstring(workbook_xml)
-            rels_root = etree.fromstring(rels_xml)
-
-            # Determine the preferred sheet from the small workbook metadata,
-            # avoiding a second openpyxl pass over the large workbook.
+            workbook_root = etree.fromstring(zin.read("xl/workbook.xml"))
+            rels_root = etree.fromstring(zin.read("xl/_rels/workbook.xml.rels"))
             sheets = workbook_root.findall(f"{{{NS_MAIN}}}sheets/{{{NS_MAIN}}}sheet")
-            target_sheet = None
-            for sheet in sheets:
-                name = str(sheet.get("name", ""))
-                if any(token in name.lower() for token in ("telemetry", "data", "flight", "test")):
-                    target_sheet = sheet
-                    break
-            target_sheet = target_sheet if target_sheet is not None else (sheets[0] if sheets else None)
+            target_sheet = next(
+                (sh for sh in sheets if any(t in str(sh.get("name", "")).lower() for t in ("telemetry", "data", "flight", "test"))),
+                sheets[0] if sheets else None
+            )
             if target_sheet is None:
                 raise ValueError("The Excel workbook contains no worksheets.")
-
-            sheet_rel_id = target_sheet.get(f"{{{NS_REL}}}id")
+            rid = target_sheet.get(f"{{{NS_REL}}}id")
             target_part = None
             for rel in rels_root.findall(f"{{{NS_PKG_REL}}}Relationship"):
-                if rel.get("Id") == sheet_rel_id:
-                    target = rel.get("Target", "")
-                    target_part = target.lstrip("/")
+                if rel.get("Id") == rid:
+                    target_part = rel.get("Target", "").lstrip("/")
                     if not target_part.startswith("xl/"):
                         target_part = "xl/" + target_part
                     break
-
-            if not target_part or target_part not in names:
+            if not target_part or target_part not in zin.namelist():
                 raise ValueError("Could not locate the selected worksheet XML.")
 
-            sheet_root = etree.fromstring(zin.read(target_part))
-            sheet_data = sheet_root.find(f"{{{NS_MAIN}}}sheetData")
-            if sheet_data is None:
-                raise ValueError("Selected worksheet contains no sheetData.")
+            with zin.open(target_part, "r") as src, open(temp_xml, "wb") as dst:
+                context = etree.iterparse(src, events=("start", "end"), huge_tree=True)
+                writer = None
+                root_ctx = None
+                sheetdata_ctx = None
+                root_seen = False
 
-            # Iterate only the worksheet rows once.  This is substantially
-            # faster than loading the workbook through openpyxl and rewriting
-            # every cell as a Python object.
-            for row in list(sheet_data):
-                if etree.QName(row).localname != "row":
-                    continue
-                old_r = int(row.get("r", "0"))
-                if old_r in delete_set:
-                    sheet_data.remove(row)
-                    continue
+                for event, elem in context:
+                    local = etree.QName(elem).localname
+                    if event == "start":
+                        if not root_seen:
+                            root_seen = True
+                            xf = etree.xmlfile(dst, encoding="UTF-8")
+                            writer = xf.__enter__()
+                            root_ctx = writer.element(elem.tag, dict(elem.attrib), nsmap=elem.nsmap)
+                            root_ctx.__enter__()
+                        elif local == "sheetData" and etree.QName(elem.getparent()).localname == "worksheet":
+                            sheetdata_ctx = writer.element(elem.tag, dict(elem.attrib))
+                            sheetdata_ctx.__enter__()
+                        continue
 
-                new_r = _shift_row_number(old_r)
-                row.set("r", str(new_r))
-                for cell in row:
-                    if etree.QName(cell).localname == "c":
-                        ref = cell.get("r")
-                        if ref:
-                            cell.set("r", _shift_cell_ref(ref))
+                    # End events.
+                    if local == "row":
+                        old_r = int(elem.get("r", "0") or 0)
+                        if old_r in delete_set:
+                            elem.clear()
+                        else:
+                            elem.set("r", str(shift_row_number(old_r)))
+                            for cell in elem:
+                                if etree.QName(cell).localname == "c" and cell.get("r"):
+                                    cell.set("r", shift_cell_ref(cell.get("r")))
+                            writer.write(elem)
+                            elem.clear()
+                    elif local == "sheetData" and sheetdata_ctx is not None:
+                        sheetdata_ctx.__exit__(None, None, None)
+                        sheetdata_ctx = None
+                        elem.clear()
+                    elif local == "dimension" and elem.get("ref"):
+                        elem.set("ref", shift_range(elem.get("ref")))
+                        writer.write(elem)
+                        elem.clear()
+                    elif root_seen and local != "worksheet":
+                        parent = elem.getparent()
+                        if parent is not None and etree.QName(parent).localname == "worksheet":
+                            writer.write(elem)
+                            elem.clear()
 
-            dimension = sheet_root.find(f"{{{NS_MAIN}}}dimension")
-            if dimension is not None and dimension.get("ref"):
-                dimension.set("ref", _shift_a1_range(dimension.get("ref")))
+                if root_ctx is not None:
+                    root_ctx.__exit__(None, None, None)
+                if writer is not None:
+                    xf.__exit__(None, None, None)
 
-            new_sheet_xml = etree.tostring(
-                sheet_root,
-                xml_declaration=True,
-                encoding="UTF-8",
-                standalone=True
-            )
-
-            os.makedirs(os.path.dirname(output_path), exist_ok=True)
-            # Level 1 minimizes the time spent recompressing the large
-            # worksheet while still producing a normal compressed XLSX.
-            with zipfile.ZipFile(
-                output_path,
-                "w",
-                compression=zipfile.ZIP_DEFLATED,
-                compresslevel=1
-            ) as zout:
-                for info in zin.infolist():
-                    data = new_sheet_xml if info.filename == target_part else zin.read(info.filename)
-                    zout.writestr(info, data)
-
+        with zipfile.ZipFile(source_path, "r") as zin, zipfile.ZipFile(
+            output_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1
+        ) as zout:
+            for info in zin.infolist():
+                if info.filename == target_part:
+                    with open(temp_xml, "rb") as fh:
+                        zout.writestr(info, fh.read())
+                else:
+                    zout.writestr(info, zin.read(info.filename))
+        try:
+            os.remove(temp_xml)
+        except OSError:
+            pass
         return output_path
 
-    # Text/legacy Excel sources are converted to a cleaned XLSX. The first
-    # remaining physical row becomes the header row for the existing pipeline.
+    # Non-XLSX inputs retain the existing conversion behavior.
     if extension == ".csv":
         import csv
         with open(source_path, "r", encoding="utf-8-sig", errors="replace", newline="") as fh:
@@ -2490,7 +2480,6 @@ def _create_cleaned_xlsx(source_path, delete_rows_1based, output_path):
             df = pd.read_csv(source_path, header=None, sep=r"\s+", engine="python")
     else:
         raise ValueError(f"Unsupported file type: {extension}")
-
     drop_zero = [r - 1 for r in delete_set if 1 <= r <= len(df)]
     if drop_zero:
         df = df.drop(index=drop_zero).reset_index(drop=True)
