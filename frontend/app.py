@@ -558,6 +558,79 @@ div[data-testid="stDownloadButton"] button * {
     color:#000000 !important;
 }
 
+
+/* ===== LIGHT INPUT CONTROLS =====
+   Keep the page light: selectboxes, multiselects and threshold input
+   must use a white field instead of the dark Streamlit theme surface.
+*/
+div[data-testid="stMainBlockContainer"] [data-testid="stSelectbox"] [data-baseweb="select"] > div,
+div[data-testid="stMainBlockContainer"] [data-testid="stMultiSelect"] [data-baseweb="select"] > div,
+div[data-testid="stMainBlockContainer"] [data-testid="stNumberInput"] > div,
+div[data-testid="stMainBlockContainer"] [data-testid="stNumberInput"] [data-baseweb="input"] > div {
+    background-color:#FFFFFF !important;
+    background:#FFFFFF !important;
+    border:1px solid #C9D7E5 !important;
+    color:#000000 !important;
+}
+
+div[data-testid="stMainBlockContainer"] [data-testid="stSelectbox"] [data-baseweb="select"] > div:hover,
+div[data-testid="stMainBlockContainer"] [data-testid="stMultiSelect"] [data-baseweb="select"] > div:hover,
+div[data-testid="stMainBlockContainer"] [data-testid="stNumberInput"] > div:hover {
+    background-color:#FFFFFF !important;
+}
+
+div[data-testid="stMainBlockContainer"] [data-testid="stSelectbox"] [data-baseweb="select"] span,
+div[data-testid="stMainBlockContainer"] [data-testid="stSelectbox"] [data-baseweb="select"] input,
+div[data-testid="stMainBlockContainer"] [data-testid="stMultiSelect"] [data-baseweb="select"] span,
+div[data-testid="stMainBlockContainer"] [data-testid="stMultiSelect"] [data-baseweb="select"] input,
+div[data-testid="stMainBlockContainer"] [data-testid="stNumberInput"] input {
+    color:#000000 !important;
+    -webkit-text-fill-color:#000000 !important;
+    background:transparent !important;
+}
+
+div[data-testid="stMainBlockContainer"] [data-testid="stSelectbox"] [data-baseweb="select"] svg,
+div[data-testid="stMainBlockContainer"] [data-testid="stMultiSelect"] [data-baseweb="select"] svg,
+div[data-testid="stMainBlockContainer"] [data-testid="stNumberInput"] svg {
+    color:#000000 !important;
+    fill:#000000 !important;
+    stroke:#000000 !important;
+}
+
+/* Dropdown menus opened from the controls */
+div[data-baseweb="popover"],
+div[data-baseweb="popover"] > div,
+ul[role="listbox"],
+div[role="listbox"] {
+    background:#FFFFFF !important;
+    color:#000000 !important;
+}
+div[data-baseweb="popover"] [role="option"],
+div[data-baseweb="popover"] [role="option"] * ,
+ul[role="listbox"] [role="option"],
+div[role="listbox"] [role="option"] {
+    background:#FFFFFF !important;
+    color:#000000 !important;
+}
+div[data-baseweb="popover"] [role="option"]:hover,
+div[data-baseweb="popover"] [aria-selected="true"],
+ul[role="listbox"] [aria-selected="true"] {
+    background:#EEF5FF !important;
+    color:#000000 !important;
+}
+
+/* Number-input +/- controls remain light and readable */
+div[data-testid="stMainBlockContainer"] [data-testid="stNumberInput"] button {
+    background:#FFFFFF !important;
+    color:#000000 !important;
+    border-color:#C9D7E5 !important;
+}
+div[data-testid="stMainBlockContainer"] [data-testid="stNumberInput"] button * {
+    color:#000000 !important;
+    fill:#000000 !important;
+    stroke:#000000 !important;
+}
+
 </style>""",unsafe_allow_html=True)
 
 # ============================================================
