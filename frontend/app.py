@@ -28,9 +28,6 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-from openpyxl import Workbook
-from openpyxl.drawing.image import Image as XLImage
-from openpyxl.styles import Font as XLFont, PatternFill, Alignment, Border, Side
 
 from core.backend_service import BackendService
 
@@ -1092,6 +1089,9 @@ def _generate_pdf(report, graph_images, anomaly_images):
 
 def _generate_xlsx(report, graph_images, anomaly_images):
     """Excel report: graph + Maximum + Minimum for every graph, and nothing else."""
+    from openpyxl import Workbook
+    from openpyxl.drawing.image import Image as XLImage
+    from openpyxl.styles import Font as XLFont
     wb = Workbook()
     ws = wb.active
     ws.title = "Graph Report"
@@ -1951,6 +1951,7 @@ def _convert_any_tabular_to_xlsx(source_path, output_path):
         try:
             engine = "pyxlsb" if ext == ".xlsb" else None
             df = pd.read_excel(source_path, header=None, engine=engine)
+            from openpyxl import Workbook
             wb = Workbook(write_only=True)
             ws = wb.create_sheet("Telemetry_Data")
             for row in df.itertuples(index=False, name=None):
@@ -2005,6 +2006,7 @@ def _convert_any_tabular_to_xlsx(source_path, output_path):
                     # Whitespace-separated telemetry is very common.
                     delimiter = None
 
+                from openpyxl import Workbook
                 wb = Workbook(write_only=True)
                 ws = wb.create_sheet("Telemetry_Data")
                 reader = (
@@ -2518,15 +2520,23 @@ def _create_cleaned_xlsx(source_path, delete_rows_1based, output_path):
                 if writer is not None:
                     xf.__exit__(None, None, None)
 
+        # Copy every untouched ZIP member as a stream.  Using zin.read() here
+        # temporarily loaded large workbook members into memory and made the
+        # Delete operation much slower on Streamlit Cloud.
         with zipfile.ZipFile(source_path, "r") as zin, zipfile.ZipFile(
             output_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1
         ) as zout:
             for info in zin.infolist():
                 if info.filename == target_part:
                     with open(temp_xml, "rb") as fh:
-                        zout.writestr(info, fh.read())
+                        with zout.open(info, "w") as out_stream:
+                            import shutil
+                            shutil.copyfileobj(fh, out_stream, length=1024 * 1024)
                 else:
-                    zout.writestr(info, zin.read(info.filename))
+                    with zin.open(info, "r") as in_stream:
+                        with zout.open(info, "w") as out_stream:
+                            import shutil
+                            shutil.copyfileobj(in_stream, out_stream, length=1024 * 1024)
         try:
             os.remove(temp_xml)
         except OSError:
