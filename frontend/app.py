@@ -1282,263 +1282,63 @@ def _xlsx_sheet_paths(xlsx_path):
 
 
 def _read_xlsx_streaming(xlsx_path):
-    """
-    Read the first substantial worksheet from an XLSX file using
-    XML streaming instead of pandas/openpyxl workbook discovery.
+    """Read an XLSX telemetry sheet with a robust header-row detector.
 
-    Designed for large telemetry files with numeric and inline-string
-    cells, including files where worksheet dimensions are not declared.
+    Some HAL workbooks contain metadata/hash rows before the real header.
+    The previous fast reader assumed the first physical row was the header,
+    which caused valid XLSX files to be rejected.
     """
     with zipfile.ZipFile(xlsx_path, "r") as archive:
-        sheet_paths = _xlsx_sheet_paths(xlsx_path)
+        header_info = _read_xlsx_header_fast(xlsx_path)
+        selected_name = header_info["worksheet"]
+        selected_path = header_info["worksheet_path"]
+        header_row_number = int(header_info.get("header_row", 1))
 
-        if not sheet_paths:
-            raise ValueError("The Excel workbook contains no worksheets.")
-
-        # Prefer a telemetry/data sheet. Otherwise choose the first sheet.
-        preferred = None
-        for sheet_name, xml_path in sheet_paths:
-            name_lower = sheet_name.lower()
-            if any(
-                token in name_lower
-                for token in ("telemetry", "data", "flight", "test")
-            ):
-                preferred = (sheet_name, xml_path)
-                break
-
-        candidates = [preferred] if preferred else []
-        candidates.extend(
-            item for item in sheet_paths if item != preferred
-        )
-
-        selected_name = None
-        selected_path = None
-
-        # Read candidates until one has a real header row and data.
-        for sheet_name, xml_path in candidates:
-            try:
-                with archive.open(xml_path, "r") as stream:
-                    header_values = None
-                    data_rows = []
-                    max_col = 0
-
-                    for _, row_element in ET.iterparse(
-                        stream,
-                        events=("end",)
-                    ):
-                        if row_element.tag != f"{{{_XLSX_MAIN_NS}}}row":
-                            continue
-
-                        row_values = {}
-
-                        for cell in row_element:
-                            if cell.tag != f"{{{_XLSX_MAIN_NS}}}c":
-                                continue
-
-                            ref = cell.attrib.get("r", "")
-                            col_index = _excel_col_index(ref)
-
-                            if col_index is None:
-                                continue
-
-                            max_col = max(max_col, col_index + 1)
-
-                            value_node = cell.find(
-                                f"{{{_XLSX_MAIN_NS}}}v"
-                            )
-                            inline_node = cell.find(
-                                f"{{{_XLSX_MAIN_NS}}}is"
-                            )
-
-                            if inline_node is not None:
-                                text_node = inline_node.find(
-                                    f"{{{_XLSX_MAIN_NS}}}t"
-                                )
-                                value = (
-                                    text_node.text
-                                    if text_node is not None
-                                    else ""
-                                )
-                            elif value_node is not None:
-                                value = value_node.text
-
-                                cell_type = cell.attrib.get("t")
-
-                                if cell_type == "b":
-                                    value = value == "1"
-                                elif cell_type == "n" or cell_type is None:
-                                    try:
-                                        number = float(value)
-                                        value = (
-                                            int(number)
-                                            if number.is_integer()
-                                            else number
-                                        )
-                                    except (TypeError, ValueError):
-                                        pass
-                            else:
-                                value = None
-
-                            row_values[col_index] = value
-
-                        if header_values is None and row_values:
-                            header_values = [
-                                row_values.get(i)
-                                for i in range(max_col)
-                            ]
-
-                            # If this is an obviously non-data sheet,
-                            # continue to the next candidate.
-                            header_text = " ".join(
-                                str(v).lower()
-                                for v in header_values
-                                if v is not None
-                            )
-
-                            if not any(
-                                token in header_text
-                                for token in (
-                                    "time",
-                                    "date",
-                                    "sample",
-                                    "rpm",
-                                    "pressure",
-                                    "temp",
-                                    "fuel",
-                                    "ng",
-                                )
-                            ):
-                                break
-
-                        elif header_values is not None:
-                            values = [
-                                row_values.get(i)
-                                for i in range(len(header_values))
-                            ]
-                            data_rows.append(values)
-
-                            # A sheet with at least one data row is enough.
-                            if len(data_rows) >= 1:
-                                selected_name = sheet_name
-                                selected_path = xml_path
-                                break
-
-                        row_element.clear()
-
-                if selected_path:
-                    break
-
-            except KeyError:
-                continue
-
-        if not selected_path or not header_values:
-            raise ValueError(
-                "No usable telemetry/data worksheet was found in the Excel file."
-            )
-
-        # Re-open the selected worksheet and read the complete dataset.
-        # This second pass is deliberate: it avoids retaining rows from
-        # candidate sheets and keeps the logic deterministic.
         rows = []
+        headers = header_info["columns"]
 
         with archive.open(selected_path, "r") as stream:
-            headers = None
-
-            for _, row_element in ET.iterparse(
-                stream,
-                events=("end",)
-            ):
+            for _, row_element in ET.iterparse(stream, events=("end",)):
                 if row_element.tag != f"{{{_XLSX_MAIN_NS}}}row":
                     continue
 
-                row_values = {}
+                row_number = int(row_element.attrib.get("r", "0") or 0)
+                if row_number <= header_row_number:
+                    row_element.clear()
+                    continue
 
+                row_values = {}
                 for cell in row_element:
                     if cell.tag != f"{{{_XLSX_MAIN_NS}}}c":
                         continue
-
-                    col_index = _excel_col_index(
-                        cell.attrib.get("r", "")
-                    )
-
+                    col_index = _excel_col_index(cell.attrib.get("r", ""))
                     if col_index is None:
                         continue
 
-                    value_node = cell.find(
-                        f"{{{_XLSX_MAIN_NS}}}v"
-                    )
-                    inline_node = cell.find(
-                        f"{{{_XLSX_MAIN_NS}}}is"
-                    )
-
+                    value_node = cell.find(f"{{{_XLSX_MAIN_NS}}}v")
+                    inline_node = cell.find(f"{{{_XLSX_MAIN_NS}}}is")
                     if inline_node is not None:
-                        text_node = inline_node.find(
-                            f"{{{_XLSX_MAIN_NS}}}t"
-                        )
-                        value = (
-                            text_node.text
-                            if text_node is not None
-                            else ""
-                        )
+                        text_nodes = inline_node.findall(f"{{{_XLSX_MAIN_NS}}}t")
+                        value = "".join((n.text or "") for n in text_nodes)
                     elif value_node is not None:
                         value = value_node.text
                         cell_type = cell.attrib.get("t")
-
                         if cell_type == "b":
                             value = value == "1"
-                        else:
+                        elif cell_type in (None, "n"):
                             try:
                                 number = float(value)
-                                value = (
-                                    int(number)
-                                    if number.is_integer()
-                                    else number
-                                )
+                                value = int(number) if number.is_integer() else number
                             except (TypeError, ValueError):
                                 pass
                     else:
                         value = None
-
                     row_values[col_index] = value
 
-                if headers is None and row_values:
-                    max_col = max(row_values.keys()) + 1
-                    headers = [
-                        row_values.get(i)
-                        for i in range(max_col)
-                    ]
-
-                    # Make column names safe and unique.
-                    safe_headers = []
-                    used = {}
-
-                    for index, header in enumerate(headers):
-                        name = str(header).strip() if header is not None else ""
-                        if not name:
-                            name = f"Column_{index + 1}"
-
-                        if name in used:
-                            used[name] += 1
-                            name = f"{name}_{used[name]}"
-                        else:
-                            used[name] = 1
-
-                        safe_headers.append(name)
-
-                    headers = safe_headers
-
-                elif headers is not None:
-                    rows.append([
-                        row_values.get(i)
-                        for i in range(len(headers))
-                    ])
-
+                rows.append([row_values.get(i) for i in range(len(headers))])
                 row_element.clear()
 
-        dataframe = pd.DataFrame(rows, columns=headers)
-
-        return dataframe, selected_name
-
+        return pd.DataFrame(rows, columns=headers), selected_name
 
 
 # ============================================================
@@ -1576,158 +1376,124 @@ def _safe_column_name(name, index, used):
 
 
 def _read_xlsx_header_fast(xlsx_path):
-    """
-    Read only the first worksheet header.
+    """Find a usable telemetry header quickly, even after metadata rows.
 
-    For the supplied 60 MB HAL workbook this avoids parsing the
-    remaining ~180,000 data rows just to populate the UI.
+    Scans only the first 50 physical worksheet rows. This keeps upload fast
+    while supporting HAL files whose real header is not row 1.
     """
+    tokens = (
+        "time", "date", "sample", "rpm", "pressure", "temp",
+        "fuel", "ng", "eot", "eop", "tgt", "delta", "speed",
+        "alt", "torque", "eng",
+    )
+
+    def parse_row(row_xml):
+        values = {}
+        match = re.search(rb"<row[^>]*>(.*?)</row>", row_xml, flags=re.DOTALL)
+        if not match:
+            return values, 0
+        body = match.group(1)
+        max_col = 0
+        cell_pattern = re.compile(rb'<c r="([A-Z]+)([0-9]+)"[^>]*>(.*?)</c>', flags=re.DOTALL)
+        for cm in cell_pattern.finditer(body):
+            col_letters = cm.group(1).decode("ascii", errors="ignore")
+            idx = _excel_col_index(col_letters + "1")
+            if idx is None:
+                continue
+            max_col = max(max_col, idx + 1)
+            cell_xml = cm.group(3)
+            inline = re.findall(rb"<t[^>]*>(.*?)</t>", cell_xml, flags=re.DOTALL)
+            if inline:
+                value = "".join(x.decode("utf-8", errors="replace") for x in inline)
+            else:
+                vm = re.search(rb"<v>(.*?)</v>", cell_xml, flags=re.DOTALL)
+                value = vm.group(1).decode("utf-8", errors="replace") if vm else ""
+            values[idx] = value
+        return values, max_col
+
     with zipfile.ZipFile(xlsx_path, "r") as archive:
         sheet_paths = _xlsx_sheet_paths(xlsx_path)
-
         if not sheet_paths:
             raise ValueError("The Excel workbook contains no worksheets.")
 
-        selected_name = None
-        selected_path = None
+        # Prefer an explicitly named telemetry/data worksheet.
+        preferred = [item for item in sheet_paths if any(
+            token in str(item[0]).lower() for token in ("telemetry", "data", "flight", "test")
+        )]
+        candidates = preferred + [item for item in sheet_paths if item not in preferred]
 
-        for sheet_name, xml_path in sheet_paths:
+        best = None
+        for sheet_name, xml_path in candidates:
             try:
                 with archive.open(xml_path, "r") as stream:
                     buffer = b""
-
-                    while len(buffer) < 2 * 1024 * 1024:
+                    physical_rows = 0
+                    candidate_rows = []
+                    while physical_rows < 50:
                         chunk = stream.read(256 * 1024)
                         if not chunk:
                             break
-
                         buffer += chunk
-                        end = buffer.find(b"</row>")
-
-                        if end == -1:
-                            continue
-
-                        first_row = buffer[:end + len(b"</row>")]
-                        match = re.search(
-                            rb"<row[^>]*>(.*?)</row>",
-                            first_row,
-                            flags=re.DOTALL
-                        )
-
-                        if not match:
+                        parts = buffer.split(b"</row>")
+                        buffer = parts.pop()
+                        for part in parts:
+                            if b"<row" not in part:
+                                continue
+                            physical_rows += 1
+                            row_xml = part + b"</row>"
+                            values, width = parse_row(row_xml)
+                            if not values:
+                                continue
+                            text_values = [str(v).strip() for v in values.values() if str(v).strip()]
+                            text_lower = " ".join(text_values).lower()
+                            token_hits = sum(1 for token in tokens if token in text_lower)
+                            text_count = sum(1 for v in text_values if not re.fullmatch(r"[-+]?\d+(?:\.\d+)?", v))
+                            score = token_hits * 10 + min(text_count, 20) + min(width, 60) * 0.02
+                            if any(token in str(sheet_name).lower() for token in ("telemetry", "data", "flight", "test")):
+                                score += 5
+                            candidate_rows.append((score, physical_rows, values, width))
+                            if physical_rows >= 50:
+                                break
+                        if physical_rows >= 50:
                             break
 
-                        row_xml = match.group(1)
-
-                        # Check that this looks like a data sheet.
-                        header_text = row_xml.decode(
-                            "utf-8",
-                            errors="ignore"
-                        ).lower()
-
-                        if any(
-                            token in header_text
-                            for token in (
-                                "time",
-                                "date",
-                                "sample",
-                                "rpm",
-                                "pressure",
-                                "temp",
-                                "fuel",
-                                "ng"
-                            )
-                        ):
-                            selected_name = sheet_name
-                            selected_path = xml_path
-
-                        break
-
-                if selected_path:
-                    break
-
+                if candidate_rows:
+                    candidate = max(candidate_rows, key=lambda x: x[0])
+                    if best is None or candidate[0] > best[0]:
+                        best = (candidate[0], sheet_name, xml_path, candidate[1], candidate[2], candidate[3])
             except Exception:
                 continue
 
-        if not selected_path:
-            raise ValueError(
-                "No usable telemetry/data worksheet was found."
-            )
+        if best is None:
+            # Last-resort fallback for unusual XLSX files.
+            try:
+                from openpyxl import load_workbook
+                wb = load_workbook(xlsx_path, read_only=True, data_only=True)
+                for ws in wb.worksheets:
+                    for physical_row, row in enumerate(ws.iter_rows(min_row=1, max_row=50, values_only=True), 1):
+                        vals = {i: v for i, v in enumerate(row) if v is not None and str(v).strip()}
+                        text = " ".join(str(v) for v in vals.values()).lower()
+                        if any(t in text for t in tokens):
+                            headers = [_safe_column_name(v, i, {}) for i, v in enumerate(row)]
+                            path = next((path for name, path in sheet_paths if name == ws.title), None)
+                            wb.close()
+                            return {"columns": headers, "worksheet": ws.title, "worksheet_path": path, "header_row": physical_row, "rows": None}
+                wb.close()
+            except Exception:
+                pass
+            raise ValueError("No usable telemetry/data worksheet was found.")
 
-        with archive.open(selected_path, "r") as stream:
-            buffer = b""
-
-            while True:
-                chunk = stream.read(256 * 1024)
-
-                if not chunk:
-                    break
-
-                buffer += chunk
-                end = buffer.find(b"</row>")
-
-                if end != -1:
-                    first_row = buffer[:end + len(b"</row>")]
-                    break
-
-                if len(buffer) > 4 * 1024 * 1024:
-                    raise ValueError(
-                        "The worksheet header could not be located."
-                    )
-
-        cells = re.findall(
-            rb'<c r="[A-Z]+1"[^>]*>(.*?)</c>',
-            first_row,
-            flags=re.DOTALL
-        )
-
-        headers = []
-
-        for cell_xml in cells:
-            inline = re.search(
-                rb"<t>(.*?)</t>",
-                cell_xml,
-                flags=re.DOTALL
-            )
-
-            if inline:
-                value = inline.group(1).decode(
-                    "utf-8",
-                    errors="replace"
-                )
-            else:
-                value_node = re.search(
-                    rb"<v>(.*?)</v>",
-                    cell_xml,
-                    flags=re.DOTALL
-                )
-                value = (
-                    value_node.group(1).decode(
-                        "utf-8",
-                        errors="replace"
-                    )
-                    if value_node
-                    else ""
-                )
-
-            headers.append(value)
-
+        _, selected_name, selected_path, header_row, header_values, width = best
+        raw_headers = [header_values.get(i, "") for i in range(width)]
         used = {}
-        headers = [
-            _safe_column_name(
-                value,
-                index,
-                used
-            )
-            for index, value in enumerate(headers)
-        ]
+        headers = [_safe_column_name(v, i, used) for i, v in enumerate(raw_headers)]
 
-        # Exact row count is intentionally not calculated here.
-        # Counting all XML rows would defeat the fast-upload goal.
         return {
             "columns": headers,
             "worksheet": selected_name,
-            "rows": None
+            "worksheet_path": selected_path,
+            "header_row": header_row,
+            "rows": None,
         }
 
 
@@ -1790,6 +1556,7 @@ def _load_xlsx_selected_columns(
     header_info = _read_xlsx_header_fast(xlsx_path)
     headers = header_info["columns"]
     worksheet = header_info["worksheet"]
+    header_row_number = int(header_info.get("header_row", 1))
 
     wanted_indices = []
     for column in selected_columns:
@@ -1839,9 +1606,11 @@ def _load_xlsx_selected_columns(
                 for row_part in parts:
                     if b"<row" not in row_part:
                         continue
-                    if not header_seen:
-                        header_seen = True
+                    row_number_match = re.search(rb'<row[^>]*\br="(\d+)"', row_part)
+                    row_number = int(row_number_match.group(1)) if row_number_match else 0
+                    if row_number <= header_row_number:
                         continue
+                    header_seen = True
 
                     values = [None] * len(wanted_indices)
                     for match in cell_pattern.finditer(row_part):
