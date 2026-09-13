@@ -1797,6 +1797,67 @@ def _convert_any_tabular_to_xlsx(source_path, output_path):
     )
 
 
+def _convert_any_tabular_to_csv(source_path, output_path):
+    """Convert a non-native telemetry file to CSV while preserving physical rows."""
+    import csv as _csv
+    ext = os.path.splitext(source_path)[1].lower()
+
+    # Structured tabular formats.
+    if ext in (".xls", ".xlsb", ".json", ".jsonl", ".ndjson", ".parquet"):
+        try:
+            if ext in (".xls", ".xlsb"):
+                engine = "pyxlsb" if ext == ".xlsb" else None
+                df = pd.read_excel(source_path, header=None, engine=engine)
+            elif ext in (".jsonl", ".ndjson"):
+                df = pd.read_json(source_path, lines=True)
+            elif ext == ".json":
+                df = pd.read_json(source_path)
+            else:
+                df = pd.read_parquet(source_path)
+            df.to_csv(output_path, index=False, header=True, encoding="utf-8-sig")
+            return output_path
+        except Exception as exc:
+            raise ValueError(f"Could not convert {ext} file to CSV: {exc}")
+
+    # Text/unknown telemetry formats: stream rows directly to CSV so large
+    # files do not need to be loaded into a DataFrame just for conversion.
+    encodings = ("utf-8-sig", "utf-8", "cp1252", "latin1")
+    last_error = None
+    for encoding in encodings:
+        try:
+            with open(source_path, "r", encoding=encoding, errors="strict", newline="") as fh:
+                sample = fh.read(65536)
+                fh.seek(0)
+                lines = sample.splitlines()
+                if not lines:
+                    raise ValueError("The uploaded file is empty.")
+                try:
+                    dialect = _csv.Sniffer().sniff(
+                        "\n".join(lines[:50]),
+                        delimiters=",;\t|:\x00"
+                    )
+                    delimiter = dialect.delimiter
+                except Exception:
+                    delimiter = None
+
+                with open(output_path, "w", encoding="utf-8-sig", newline="") as out:
+                    writer = _csv.writer(out)
+                    reader = (
+                        _csv.reader(fh, dialect)
+                        if delimiter is not None
+                        else _csv.reader(fh, delimiter=" ", skipinitialspace=True)
+                    )
+                    for row in reader:
+                        if delimiter is None and len(row) == 1:
+                            row = row[0].split()
+                        writer.writerow(row)
+            return output_path
+        except Exception as exc:
+            last_error = exc
+
+    raise ValueError(f"The uploaded file could not be converted to CSV. Parser error: {last_error}")
+
+
 def _normalize_upload_to_xlsx(raw_path, input_directory, signature):
     """Return an XLSX processing path for any supported/recognizable upload."""
     ext = os.path.splitext(raw_path)[1].lower()
@@ -2402,17 +2463,23 @@ for _file in _persistent_uploaded_files:
         with open(_raw_path, "wb") as _out:
             _out.write(_file.getvalue())
 
-    # Every non-XLSX upload is normalized to XLSX before cleanup/reading.
-    # This includes .003, .005, .00.out, .out, .dat, .log, CSV, TXT, JSON, etc.
-    # The converted workbook preserves the physical rows so the user can
-    # delete unwanted leading rows before the normal Excel pipeline starts.
-    try:
-        _path, _was_converted = _normalize_upload_to_xlsx(
-            _raw_path, input_directory, _signature
-        )
-    except Exception as exc:
-        st.error(f"Unable to convert {_file.name} to Excel: {exc}")
-        continue
+    # Only XLSX and CSV enter the cleanup workflow directly.
+    # XLS, TXT, and every other supported format must first be converted
+    # to a user-selected XLSX or CSV file so the converted file can be
+    # downloaded before row cleanup begins.
+    _native_extensions = {".xlsx", ".csv"}
+    _was_converted = False
+    _requires_conversion = _original_extension not in _native_extensions
+
+    _converted_path = _existing_registry.get("converted_path")
+    _converted_format = _existing_registry.get("converted_format")
+    if _requires_conversion and _converted_path and os.path.exists(_converted_path):
+        _path = _converted_path
+        _was_converted = True
+    elif _requires_conversion:
+        _path = _raw_path
+    else:
+        _path = _raw_path
 
     _size = os.path.getsize(_raw_path)
 
@@ -2427,6 +2494,9 @@ for _file in _persistent_uploaded_files:
         "path": _path,
         "source_path": _raw_path,
         "is_003": _original_extension == ".003",
+        "requires_conversion": _requires_conversion and not _was_converted,
+        "converted_path": _converted_path if _was_converted else None,
+        "converted_format": _converted_format if _was_converted else None,
         "cleaned": bool(_existing_registry.get("cleaned", False)),
     })
 
@@ -2437,6 +2507,9 @@ for _file in _persistent_uploaded_files:
         "path": _path if not _existing_registry.get("cleaned") else _existing_registry.get("path", _path),
         "source_path": _raw_path,
         "is_003": _original_extension == ".003",
+        "requires_conversion": _requires_conversion and not _was_converted,
+        "converted_path": _converted_path if _was_converted else None,
+        "converted_format": _converted_format if _was_converted else None,
         "cleaned": bool(_existing_registry.get("cleaned", False)),
     }
     if _existing_registry.get("cleaned"):
@@ -2463,6 +2536,10 @@ for _signature, _meta in st.session_state.known_file_registry.items():
             "path": _path,
             "source_path": _meta.get("source_path", _path),
             "is_003": bool(_meta.get("is_003", False)),
+            "requires_conversion": bool(_meta.get("requires_conversion", False)),
+            "converted_path": _meta.get("converted_path"),
+            "converted_format": _meta.get("converted_format"),
+            "cleaned": bool(_meta.get("cleaned", False)),
         })
 
 _current_signatures = [item["signature"] for item in _current_files]
@@ -2556,6 +2633,94 @@ if _selected_signature is not None:
         _selected_filename = _selected_item["name"]
         if _selected_item.get("cleaned"):
             st.session_state.row_cleanup_done_by_signature[_selected_signature] = True
+
+        # --------------------------------------------------------
+        # NON-NATIVE FILE CONVERSION — USER CHOICE
+        # --------------------------------------------------------
+        # XLSX/XLS/CSV/TXT continue directly. For every other supported or
+        # recognizable format, the user explicitly chooses CSV or Excel,
+        # downloads that converted file, and only then reaches row cleanup.
+        if _selected_item.get("requires_conversion"):
+            st.divider()
+            st.markdown(
+                '<div class="section-label">FILE CONVERSION</div>',
+                unsafe_allow_html=True
+            )
+            st.subheader("Convert file before analysis")
+            st.caption(
+                f"{_selected_filename} is not a native Excel/CSV/TXT input. "
+                "Choose a format below. The converted file will be available for download, "
+                "then you can remove unwanted rows before analysis."
+            )
+
+            _conversion_choice = st.radio(
+                "Convert to",
+                ["Excel (.xlsx)", "CSV (.csv)"],
+                horizontal=True,
+                key=f"conversion_choice_{_selected_signature}"
+            )
+
+            if st.button(
+                "Convert & Continue",
+                type="primary",
+                key=f"convert_continue_{_selected_signature}"
+            ):
+                _conversion_dir = os.path.join(PROJECT_ROOT, "input", "converted")
+                os.makedirs(_conversion_dir, exist_ok=True)
+                _base_name = os.path.splitext(_selected_filename)[0]
+                _safe_sig = re.sub(r"[^A-Za-z0-9_-]+", "_", str(_selected_signature))[:50]
+                try:
+                    with st.spinner("Converting file..."):
+                        if _conversion_choice.startswith("Excel"):
+                            _converted_output = os.path.join(
+                                _conversion_dir,
+                                f"{_base_name}_{_safe_sig}_converted.xlsx"
+                            )
+                            if not (os.path.exists(_converted_output) and os.path.getsize(_converted_output) > 0):
+                                _convert_any_tabular_to_xlsx(_selected_path, _converted_output)
+                            _converted_format_value = "xlsx"
+                        else:
+                            _converted_output = os.path.join(
+                                _conversion_dir,
+                                f"{_base_name}_{_safe_sig}_converted.csv"
+                            )
+                            if not (os.path.exists(_converted_output) and os.path.getsize(_converted_output) > 0):
+                                _convert_any_tabular_to_csv(_selected_path, _converted_output)
+                            _converted_format_value = "csv"
+
+                    st.session_state.known_file_registry[_selected_signature]["path"] = _converted_output
+                    st.session_state.known_file_registry[_selected_signature]["converted_path"] = _converted_output
+                    st.session_state.known_file_registry[_selected_signature]["converted_format"] = _converted_format_value
+                    st.session_state.known_file_registry[_selected_signature]["requires_conversion"] = False
+                    st.session_state.converted_file = _converted_output
+                    st.session_state.file_header_by_signature.pop(_selected_signature, None)
+                    _clear_active_workspace()
+                    st.session_state.selected_file_signature = _selected_signature
+                    st.rerun()
+                except Exception as _conversion_exc:
+                    st.error(f"Could not convert {_selected_filename}: {_conversion_exc}")
+
+            # Do not let the raw non-native file enter the analysis pipeline.
+            st.stop()
+
+        # Converted file download is shown only on Data Input.
+        if st.session_state.active_tab == "Data Input" and _selected_item.get("converted_path"):
+            _converted_download_path = _selected_item.get("converted_path")
+            if os.path.exists(_converted_download_path):
+                _converted_ext = os.path.splitext(_converted_download_path)[1].lower()
+                _converted_mime = (
+                    "text/csv" if _converted_ext == ".csv"
+                    else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
+                with open(_converted_download_path, "rb") as _converted_fh:
+                    st.success("Converted file is ready for download.")
+                    st.download_button(
+                        "⬇️ Download Converted " + ("CSV" if _converted_ext == ".csv" else "Excel"),
+                        _converted_fh.read(),
+                        file_name=os.path.basename(_converted_download_path),
+                        mime=_converted_mime,
+                        key=f"download_converted_{_selected_signature}"
+                    )
 
         # --------------------------------------------------------
         # FIRST SIX RAW ROWS — USER CLEANUP
@@ -2937,69 +3102,6 @@ if st.session_state.active_tab == "Data Input":
         st.write(
             service.attributes
         )
-
-
-        # ====================================================
-        # TEXT/003 → EXCEL
-        # ====================================================
-
-        if st.session_state.converted_file:
-
-            st.divider()
-
-            st.subheader(
-                "File → Excel Conversion"
-            )
-
-
-            st.success(
-                "The uploaded .003 file has been converted to Excel."
-            )
-
-
-            converted_path = (
-                st.session_state.converted_file
-            )
-
-
-            try:
-
-                with open(
-                    converted_path,
-                    "rb"
-                ) as file:
-
-                    converted_data = file.read()
-
-
-                st.download_button(
-
-                    label=
-                        "⬇️ Download Converted Excel",
-
-                    data=converted_data,
-
-                    file_name=
-                        "converted_data.xlsx",
-
-                    mime=(
-                        "application/vnd.openxmlformats-"
-                        "officedocument.spreadsheetml.sheet"
-                    ),
-
-                    use_container_width=True,
-
-                    key=
-                        "download_converted_excel"
-
-                )
-
-
-            except FileNotFoundError:
-
-                st.error(
-                    "Converted Excel file could not be found."
-                )
 
 
         # ====================================================
