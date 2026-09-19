@@ -1,0 +1,30 @@
+# Python
+venv/
+portable_python/
+python/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Build / deployment
+build/
+dist/
+*.spec
+*.exe
+
+# Large deployment archives
+*.zip
+*.7z
+
+# Generated files
+output/
+input/
+
+# Local environment/config
+.env
+.streamlit/secrets.toml
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
